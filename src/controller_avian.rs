@@ -1,6 +1,6 @@
 use std::f32::consts::*;
 
-use avian3d::{parry::shape::SharedShape, prelude::*};
+use avian3d::{math::{RVec3, ToF32Precision, ToRealPrecision}, parry::shape::SharedShape, prelude::*};
 use bevy::{input::mouse::MouseMotion, math::Vec3Swizzles, prelude::*};
 
 pub struct FpsControllerPlugin;
@@ -117,7 +117,7 @@ pub struct FpsController {
     pub key_crouch: KeyCode,
     pub experimental_enable_ledge_cling: bool,
 
-    pub previous_translation: Option<Vec3>,
+    pub previous_translation: Option<RVec3>,
 }
 
 impl Default for FpsController {
@@ -260,7 +260,8 @@ pub fn fps_controller_move(
             &FpsControllerInput,
             &mut FpsController,
             &Collider,
-            &mut Transform,
+            &mut Position,
+            &Rotation,
             &mut LinearVelocity,
         ),
         (With<LogicalPlayer>, Without<RenderPlayer>),
@@ -268,8 +269,8 @@ pub fn fps_controller_move(
 ) {
     let dt = time.delta_secs();
 
-    for (entity, input, mut controller, collider, mut transform, mut velocity) in query.iter_mut() {
-        controller.previous_translation = Some(transform.translation);
+    for (entity, input, mut controller, collider, mut position, rotation, mut velocity) in query.iter_mut() {
+        controller.previous_translation = Some(position.0);
 
         if input.fly {
             controller.move_mode = match controller.move_mode {
@@ -326,8 +327,8 @@ pub fn fps_controller_move(
                     // We do not want the shape cast to detect it,
                     // so provide a slightly smaller collider in the XZ plane
                     &scaled_collider_laterally(&collider, SLIGHT_SCALE_DOWN),
-                    transform.translation,
-                    transform.rotation,
+                    position.0,
+                    rotation.0,
                     -Dir3::Y,
                     &ShapeCastConfig::from_max_distance(controller.grounded_distance),
                     &filter,
@@ -418,13 +419,13 @@ pub fn fps_controller_move(
                 {
                     // Try putting the player forward, but instead lifted upward by the step offset
                     // If we can find a surface below us, we can adjust our position to be on top of it
-                    let future_position = transform.translation + velocity.0 * dt;
+                    let future_position = position.0 + velocity.0.real() * dt.real();
                     let future_position_lifted =
-                        future_position + Vec3::Y * controller.experimental_step_offset;
+                        future_position + RVec3::Y * controller.experimental_step_offset.real();
                     if let Some(hit) = spatial_query_pipeline.cast_shape(
                         &collider,
                         future_position_lifted,
-                        transform.rotation,
+                        rotation.0,
                         Dir3::new_unchecked(-Vec3::Y),
                         &ShapeCastConfig::from_max_distance(
                             controller.experimental_step_offset * SLIGHT_SCALE_DOWN,
@@ -434,8 +435,8 @@ pub fn fps_controller_move(
                         let has_traction_on_ledge =
                             Vec3::dot(hit.normal1, Vec3::Y) > controller.traction_normal_cutoff;
                         if has_traction_on_ledge {
-                            transform.translation.y +=
-                                controller.experimental_step_offset - hit.distance;
+                            position.0.y +=
+                                controller.experimental_step_offset.real() - hit.distance.real();
                         }
                     }
                 }
@@ -451,22 +452,24 @@ pub fn fps_controller_move(
                         let overhang = overhang_component(
                             entity,
                             &collider,
-                            transform.as_ref(),
+                            position.as_ref(),
+                            rotation,
                             &spatial_query_pipeline,
-                            velocity.0,
+                            velocity.0.real(),
                             dt,
                         );
                         if let Some(overhang) = overhang {
-                            velocity.0 -= overhang;
+                            velocity.0 -= overhang.as_vec3();
                         }
                     }
                     // If we are still overhanging consider unsolvable and freeze
                     if overhang_component(
                         entity,
                         &collider,
-                        transform.as_ref(),
+                        position.as_ref(),
+                        rotation,
                         &spatial_query_pipeline,
-                        velocity.0,
+                        velocity.0.real(),
                         dt,
                     )
                     .is_some()
@@ -484,9 +487,9 @@ pub fn fps_controller_move(
 fn collider_y_offset(collider: &Collider) -> Vec3 {
     Vec3::Y
         * if let Some(cylinder) = collider.shape().as_cylinder() {
-            cylinder.half_height
+            cylinder.half_height.f32()
         } else if let Some(capsule) = collider.shape().as_capsule() {
-            capsule.half_height() + capsule.radius
+            (capsule.half_height() + capsule.radius).f32()
         } else {
             panic!("Controller must use a cylinder or capsule collider")
         }
@@ -495,10 +498,10 @@ fn collider_y_offset(collider: &Collider) -> Vec3 {
 /// Return a collider that is scaled laterally (XZ plane) but not vertically (Y axis).
 fn scaled_collider_laterally(collider: &Collider, scale: f32) -> Collider {
     if let Some(cylinder) = collider.shape().as_cylinder() {
-        let new_cylinder = Collider::cylinder(cylinder.radius * scale, cylinder.half_height * 2.0);
+        let new_cylinder = Collider::cylinder(cylinder.radius.f32() * scale, cylinder.half_height.f32() * 2.0);
         new_cylinder
     } else if let Some(capsule) = collider.shape().as_capsule() {
-        let new_capsule = Collider::capsule(capsule.radius * scale, capsule.segment.length());
+        let new_capsule = Collider::capsule(capsule.radius.f32() * scale, capsule.segment.length().f32());
         new_capsule
     } else {
         panic!("Controller must use a cylinder or capsule collider")
@@ -508,12 +511,13 @@ fn scaled_collider_laterally(collider: &Collider, scale: f32) -> Collider {
 fn overhang_component(
     entity: Entity,
     collider: &Collider,
-    transform: &Transform,
+    position: &Position,
+    rotation: &Rotation,
     spatial_query: &SpatialQuery,
-    velocity: Vec3,
+    velocity: RVec3,
     dt: f32,
-) -> Option<Vec3> {
-    if velocity == Vec3::ZERO {
+) -> Option<RVec3> {
+    if velocity == RVec3::ZERO {
         return None;
     }
 
@@ -523,18 +527,22 @@ fn overhang_component(
     let cast_capsule = Collider::capsule(0.01, 0.5);
     let filter = SpatialQueryFilter::default().with_excluded_entities([entity]);
     let collider_offset = collider_y_offset(collider);
-    let future_position = transform.translation - collider_offset + velocity * dt;
+
+    let current_position = position.0;
+
+    let future_position = current_position - collider_offset.real() + velocity * dt.real();
 
     if let Some(hit) = spatial_query.cast_shape(
         &cast_capsule,
         future_position,
-        transform.rotation,
-        Dir3::new_unchecked((-velocity).normalize()),
+        rotation.0,
+        Dir3::new_unchecked(-Vec3::Y),
         &ShapeCastConfig::from_max_distance(0.5),
         &filter,
-    ) {
+    )
+    {
         let cast = spatial_query.cast_ray(
-            future_position + Vec3::Y * 0.125,
+            future_position + RVec3::Y * 0.125,
             Dir3::new_unchecked(-Vec3::Y),
             0.375,
             false,
@@ -542,8 +550,8 @@ fn overhang_component(
         );
         // Make sure that this is actually a ledge, e.g. there is no ground in front of us
         if cast.is_none() {
-            let normal = -hit.normal1;
-            let alignment = Vec3::dot(velocity, normal);
+            let normal = -hit.normal1.real();
+            let alignment = RVec3::dot(velocity, normal);
             return Some(alignment * normal);
         }
     }
@@ -583,13 +591,14 @@ pub fn fps_controller_update_collider(
     mut query: Query<(&FpsController, &mut Collider), With<LogicalPlayer>>,
 ) {
     for (controller, mut collider) in query.iter_mut() {
+        let controller_height = controller.height.real();
         if let Some(capsule) = collider.shape().as_capsule() {
             let radius = capsule.radius;
-            let half = Vec3::Y * (controller.height * 0.5 - radius);
+            let half = RVec3::Y * (controller_height * 0.5 - radius);
             collider.set_shape(SharedShape::capsule(-half, half, radius));
         } else if let Some(cylinder) = collider.shape().as_cylinder() {
             let radius = cylinder.radius;
-            collider.set_shape(SharedShape::cylinder(controller.height * 0.5, radius));
+            collider.set_shape(SharedShape::cylinder(controller_height * 0.5, radius));
         } else {
             panic!("Controller must use a cylinder or capsule collider")
         }
@@ -618,10 +627,10 @@ pub fn fps_controller_render(
         {
             let previous = controller.previous_translation;
             let current = logical_transform.translation;
-            let interpolated = previous.unwrap_or(current).lerp(current, t);
+            let interpolated = previous.unwrap_or(current).lerp(current, t.real());
             let collider_offset = collider_y_offset(collider);
             let camera_offset = Vec3::Y * camera_config.height_offset;
-            render_transform.translation = interpolated + collider_offset + camera_offset;
+            render_transform.translation = interpolated.real() + collider_offset + camera_offset;
             render_transform.rotation =
                 Quat::from_euler(EulerRot::YXZ, controller.yaw, controller.pitch, 0.0);
         }

@@ -12,11 +12,12 @@ description = "Bevy plugin that adds a Source engine inspired FPS movement contr
 [dependencies]
 bevy = "0.20"
 bevy_rapier3d = { version = "0.37", optional = true }
-avian3d = { version = "0.8", optional = true }
+avian3d = { version = "0.8", default-features = false, optional = true }
 
 [features]
 default = []
-avian = ["dep:avian3d"]
+avian-f32 = ["dep:avian3d", "avian3d/3d", "avian3d/parry-f32"]
+avian-f64 = ["dep:avian3d", "avian3d/3d", "avian3d/f64", "avian3d/parry-f64"]
 rapier = ["dep:bevy_rapier3d"]
 
 [[example]]
